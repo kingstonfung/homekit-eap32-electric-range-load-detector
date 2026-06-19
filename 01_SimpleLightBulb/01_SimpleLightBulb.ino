@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <esp_task_wdt.h>
+#include <HTTPClient.h>
 
 #define LED_PIN       2
 #define CONTACT_PIN   4
@@ -12,10 +13,14 @@
 #define OLED_RESET    -1
 #define OLED_I2C_ADDR 0x3C
 
-const unsigned long SCREEN_TIMEOUT_MS     = 5UL * 60UL * 1000UL; // 5 minutes
-const unsigned long CONTACT_OFF_DELAY_MS  = 45UL * 1000UL;        // 45 seconds
+const unsigned long SCREEN_TIMEOUT_MS     = 5UL * 60UL * 1000UL; // 5 minutes 
+const unsigned long CONTACT_OFF_DELAY_MS  = 90UL * 1000UL;        // 45 seconds
 const unsigned long SCREEN_PROBE_INTERVAL = 2UL * 1000UL;         // 2 seconds
 const char*         DISPLAY_TITLE         = "Elec. Range Load:";
+
+const unsigned long INITIAL_MINUTES_FOR_FIRST_NOTIFICATAION = 45;
+const unsigned long INTERVAL_MINUTES_FOR_NOTIFICATIONS      = 15;
+const char*         NTFY_URL = "https://ntfy.sh/your-unique-topic-identifier-here";
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SpanCharacteristic* power;
@@ -33,6 +38,11 @@ bool          lastContactState = false;
 unsigned long lastDebounceTime = 0;
 const unsigned long DEBOUNCE_DELAY = 250UL;
 
+// --- Stove-on notification timer state ---
+bool          ledIsOn           = false;
+unsigned long ledOnStartTime    = 0;
+unsigned int  notificationsSent = 0;
+
 // ---------- helpers ----------
 
 inline bool elapsed(unsigned long timestamp, unsigned long interval) {
@@ -42,6 +52,62 @@ inline bool elapsed(unsigned long timestamp, unsigned long interval) {
 bool probeI2C(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
+}
+
+// ---------- stove-on notification timer ----------
+
+void sendStoveNotification(unsigned long minutesOn) {
+  if (!WiFi.isConnected()) {
+    Serial.println("WiFi not connected — skipping notification POST");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(NTFY_URL);
+
+  String body = "Stove is on for " + String(minutesOn) + " minutes";
+  int httpCode = http.POST(body);
+
+  Serial.printf("ntfy POST (%lu min) -> HTTP %d\n", minutesOn, httpCode);
+
+  http.end();
+}
+
+// Call whenever the LED's actual on/off state changes (turns the
+// notification timer on or off and resets it).
+void setLED(bool on) {
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+
+  if (on && !ledIsOn) {
+    ledIsOn           = true;
+    ledOnStartTime    = millis();
+    notificationsSent = 0;
+  } else if (!on && ledIsOn) {
+    ledIsOn           = false;
+    ledOnStartTime    = 0;
+    notificationsSent = 0;
+  }
+}
+
+// Call every loop() iteration; fires the first notification after
+// INITIAL_MINUTES_FOR_FIRST_NOTIFICATAION minutes, then again every
+// INTERVAL_MINUTES_FOR_NOTIFICATIONS minutes after that, for as long
+// as the LED stays on.
+void checkStoveNotifications() {
+  if (!ledIsOn) return;
+
+  unsigned long elapsedMs = millis() - ledOnStartTime;
+
+  unsigned long nextThresholdMinutes =
+      INITIAL_MINUTES_FOR_FIRST_NOTIFICATAION +
+      (notificationsSent * INTERVAL_MINUTES_FOR_NOTIFICATIONS);
+
+  unsigned long nextThresholdMs = nextThresholdMinutes * 60UL * 1000UL;
+
+  if (elapsedMs >= nextThresholdMs) {
+    notificationsSent++;
+    sendStoveNotification(nextThresholdMinutes);
+  }
 }
 
 void setScreenPower(bool on) {
@@ -126,7 +192,7 @@ struct MyLightBulb : Service::LightBulb {
   boolean update() override {
     bool isOn = power->getNewVal();
     Serial.printf("HomeKit set light %s\n", isOn ? "ON" : "OFF");
-    digitalWrite(LED_PIN, isOn ? HIGH : LOW);
+    setLED(isOn);
     updateDisplay(isOn, "HomeKit");
     if (isOn) pendingOff = false;
     return true;
@@ -153,7 +219,7 @@ struct RestartSwitch : Service::Switch {
       }
 
       // 2. Instantly kill the physical LED pin
-      digitalWrite(LED_PIN, LOW);
+      setLED(false);
 
       // 3. Clear HomeSpan state memory so it boots up as OFF
       if (::power != nullptr) {
@@ -203,7 +269,8 @@ void setup() {
     screenOn         = false;
   }
 
-  homeSpan.begin(Category::Lighting, DISPLAY_TITLE);
+  homeSpan.enableOTA();
+  homeSpan.begin(Category::Lighting, DISPLAY_TITLE, "StoveSensor");
 
   new SpanAccessory();
     new Service::AccessoryInformation();
@@ -224,6 +291,9 @@ void loop() {
 
   // --- Display reconnection probe ---
   checkDisplayConnection();
+
+  // --- Stove-on notification timer ---
+  checkStoveNotifications();
 
   // --- Detect WiFi state changes ---
   static bool lastWiFiState = false;
@@ -251,7 +321,7 @@ void loop() {
     Serial.println("Contact delay elapsed — turning OFF");
 
     power->setVal(false);
-    digitalWrite(LED_PIN, LOW);
+    setLED(false);
 
     updateDisplay(false, "contact");
   }
@@ -272,7 +342,7 @@ void loop() {
       Serial.println("Contact CLOSED — turning ON");
 
       power->setVal(true);
-      digitalWrite(LED_PIN, HIGH);
+      setLED(true);
 
       updateDisplay(true, "contact");
 
@@ -288,4 +358,3 @@ void loop() {
     }
   }
 }
-
